@@ -9,13 +9,20 @@ using Microsoft.Win32.SafeHandles;
 
 namespace MemQuota
 {
+    internal sealed class ProcessTarget
+    {
+        public int Id { get; set; }
+        public long? CreationTime { get; set; }
+    }
+
     internal sealed class ApplicationMemory
     {
         public string Name { get; set; }
         public string ExecutablePath { get; set; }
         public long Bytes { get; set; }
+        public ulong? EstimatedReleasableBytes { get; set; }
         public int ProcessCount { get; set; }
-        public List<int> ProcessIds { get; private set; } = new List<int>();
+        public List<ProcessTarget> Processes { get; private set; } = new List<ProcessTarget>();
     }
 
     internal sealed class MemorySnapshot
@@ -43,8 +50,37 @@ namespace MemQuota
             public ulong AvailableExtendedVirtual;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessMemoryCountersEx2
+        {
+            public uint Size;
+            public uint PageFaultCount;
+            public UIntPtr PeakWorkingSetSize;
+            public UIntPtr WorkingSetSize;
+            public UIntPtr QuotaPeakPagedPoolUsage;
+            public UIntPtr QuotaPagedPoolUsage;
+            public UIntPtr QuotaPeakNonPagedPoolUsage;
+            public UIntPtr QuotaNonPagedPoolUsage;
+            public UIntPtr PagefileUsage;
+            public UIntPtr PeakPagefileUsage;
+            public UIntPtr PrivateUsage;
+            public UIntPtr PrivateWorkingSetSize;
+            public ulong SharedCommitUsage;
+        }
+
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GlobalMemoryStatusEx([In, Out] MemoryStatus status);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool GetProcessMemoryInfo(SafeProcessHandle process,
+            out ProcessMemoryCountersEx2 counters, uint size);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EmptyWorkingSet(SafeProcessHandle process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(SafeProcessHandle process, out long creationTime,
+            out long exitTime, out long kernelTime, out long userTime);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern SafeProcessHandle OpenProcess(uint access, bool inheritHandle, int processId);
@@ -62,6 +98,79 @@ namespace MemQuota
                 var path = new StringBuilder(32768);
                 int size = path.Capacity;
                 return QueryFullProcessImageName(process, 0, path, ref size) ? path.ToString() : null;
+            }
+        }
+
+        private static long? GetCreationTime(int processId)
+        {
+            using (SafeProcessHandle process = OpenProcess(0x1000, false, processId))
+            {
+                long creation, exit, kernel, user;
+                if (process.IsInvalid || !GetProcessTimes(process, out creation, out exit, out kernel, out user))
+                    return null;
+                return creation;
+            }
+        }
+
+        public static string TrimWorkingSets(ApplicationMemory application)
+        {
+            int succeeded = 0;
+            var failures = new List<string>();
+            foreach (ProcessTarget target in application.Processes)
+            {
+                if (!target.CreationTime.HasValue)
+                {
+                    failures.Add(string.Format("PID {0}: process identity unavailable", target.Id));
+                    continue;
+                }
+                using (SafeProcessHandle process = OpenProcess(0x1000 | 0x0100, false, target.Id))
+                {
+                    if (process.IsInvalid)
+                    {
+                        failures.Add(string.Format("PID {0}: {1}", target.Id, new Win32Exception(Marshal.GetLastWin32Error()).Message));
+                        continue;
+                    }
+                    long creation, exit, kernel, user;
+                    if (!GetProcessTimes(process, out creation, out exit, out kernel, out user))
+                    {
+                        failures.Add(string.Format("PID {0}: {1}", target.Id, new Win32Exception(Marshal.GetLastWin32Error()).Message));
+                        continue;
+                    }
+                    if (creation != target.CreationTime.Value)
+                    {
+                        failures.Add(string.Format("PID {0}: process has changed", target.Id));
+                        continue;
+                    }
+                    if (!EmptyWorkingSet(process))
+                    {
+                        failures.Add(string.Format("PID {0}: {1}", target.Id, new Win32Exception(Marshal.GetLastWin32Error()).Message));
+                        continue;
+                    }
+                    succeeded++;
+                }
+            }
+
+            string result = string.Format("{0}: requested working-set trimming for {1} of {2} processes.\n" +
+                "Windows may reclaim pages temporarily; actual memory savings are not guaranteed.",
+                application.Name, succeeded, application.Processes.Count);
+            if (failures.Count > 0)
+            {
+                result += "\n\nNot trimmed:\n" + string.Join("\n", failures.Take(8));
+                if (failures.Count > 8) result += string.Format("\n... and {0} more.", failures.Count - 8);
+            }
+            return result;
+        }
+
+        private static ulong? GetPrivateWorkingSet(int processId)
+        {
+            const uint queryLimitedInformation = 0x1000;
+            using (SafeProcessHandle process = OpenProcess(queryLimitedInformation, false, processId))
+            {
+                if (process.IsInvalid) return null;
+                ProcessMemoryCountersEx2 counters;
+                uint size = (uint)Marshal.SizeOf(typeof(ProcessMemoryCountersEx2));
+                if (!GetProcessMemoryInfo(process, out counters, size) || counters.Size < size) return null;
+                return counters.PrivateWorkingSetSize.ToUInt64();
             }
         }
 
@@ -93,7 +202,8 @@ namespace MemQuota
 
                         application.Bytes += bytes;
                         application.ProcessCount++;
-                        application.ProcessIds.Add(process.Id);
+                        int id = process.Id;
+                        application.Processes.Add(new ProcessTarget { Id = id, CreationTime = GetCreationTime(id) });
                     }
                     catch (Win32Exception) { inaccessible++; }
                     catch (InvalidOperationException) { inaccessible++; }
@@ -104,11 +214,19 @@ namespace MemQuota
             List<ApplicationMemory> topApplications = applications.Values.OrderByDescending(item => item.Bytes).Take(5).ToList();
             foreach (ApplicationMemory application in topApplications)
             {
-                foreach (int id in application.ProcessIds)
+                ulong estimatedBytes = 0;
+                bool estimateAvailable = true;
+                foreach (ProcessTarget target in application.Processes)
                 {
-                    application.ExecutablePath = GetExecutablePath(id);
-                    if (application.ExecutablePath != null) break;
+                    if (application.ExecutablePath == null)
+                        application.ExecutablePath = GetExecutablePath(target.Id);
+                    ulong? privateWorkingSet = GetPrivateWorkingSet(target.Id);
+                    if (privateWorkingSet.HasValue)
+                        estimatedBytes += privateWorkingSet.Value;
+                    else
+                        estimateAvailable = false;
                 }
+                application.EstimatedReleasableBytes = estimateAvailable ? (ulong?)estimatedBytes : null;
             }
 
             return new MemorySnapshot

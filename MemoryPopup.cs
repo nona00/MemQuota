@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace MemQuota
@@ -16,8 +17,13 @@ namespace MemQuota
         private readonly Font headerFont = new Font("Segoe UI", 9, FontStyle.Bold);
         private readonly Font bodyFont = new Font("Segoe UI", 9, FontStyle.Regular);
         private readonly Font smallFont = new Font("Segoe UI", 8, FontStyle.Regular);
+        private readonly Button[] freeButtons = new Button[5];
+        private readonly ToolTip toolTip = new ToolTip();
         private MemorySnapshot snapshot;
+        private ApplicationMemory pressedApplication;
         private string error;
+
+        public bool IsActionInProgress { get; private set; }
 
         public MemoryPopup()
         {
@@ -25,9 +31,32 @@ namespace MemQuota
             ShowInTaskbar = false;
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
-            ClientSize = new Size(420, 374);
+            ClientSize = new Size(420, 439);
             BackColor = Color.FromArgb(22, 30, 43);
             DoubleBuffered = true;
+            for (int i = 0; i < freeButtons.Length; i++)
+            {
+                var button = new Button
+                {
+                    Text = "Free Mem",
+                    Font = headerFont,
+                    ForeColor = Color.White,
+                    BackColor = Color.FromArgb(37, 99, 170),
+                    FlatStyle = FlatStyle.Flat,
+                    Bounds = new Rectangle(304, 80 + i * 63, 96, 42),
+                    Visible = false,
+                    TabStop = false
+                };
+                button.FlatAppearance.BorderSize = 0;
+                button.MouseDown += delegate(object sender, MouseEventArgs e)
+                {
+                    if (e.Button == MouseButtons.Left) pressedApplication = ((Button)sender).Tag as ApplicationMemory;
+                };
+                button.Click += FreeMemoryClick;
+                toolTip.SetToolTip(button, "Ask Windows to trim the working sets of this process group. Memory savings are not guaranteed.");
+                Controls.Add(button);
+                freeButtons[i] = button;
+            }
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -46,6 +75,7 @@ namespace MemQuota
         {
             snapshot = value;
             error = null;
+            UpdateButtons();
             var paths = new HashSet<string>(value.Applications.Where(item => !string.IsNullOrEmpty(item.ExecutablePath))
                 .Select(item => item.ExecutablePath), StringComparer.OrdinalIgnoreCase);
             foreach (string path in icons.Keys.Where(path => !paths.Contains(path)).ToArray())
@@ -60,7 +90,47 @@ namespace MemQuota
         {
             snapshot = null;
             error = message;
+            UpdateButtons();
             Invalidate();
+        }
+
+        private void UpdateButtons()
+        {
+            for (int i = 0; i < freeButtons.Length; i++)
+            {
+                Button button = freeButtons[i];
+                ApplicationMemory application = snapshot != null && i < snapshot.Applications.Count
+                    ? snapshot.Applications[i] : null;
+                button.Tag = application;
+                button.Visible = application != null;
+                button.Enabled = application != null && !IsActionInProgress;
+                button.AccessibleName = application == null ? "Free memory" : "Free memory: " + application.Name;
+            }
+        }
+
+        private async void FreeMemoryClick(object sender, EventArgs e)
+        {
+            var application = pressedApplication ?? ((Button)sender).Tag as ApplicationMemory;
+            pressedApplication = null;
+            if (application == null || IsActionInProgress) return;
+            IsActionInProgress = true;
+            UpdateButtons();
+            try
+            {
+                string result = await Task.Run(() => MemoryMonitor.TrimWorkingSets(application));
+                if (!IsDisposed) MessageBox.Show(this, result, "MemQuota", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed)
+                    MessageBox.Show(this, string.Format("Memory trimming failed: {0} (0x{1:X8})", ex.GetType().Name, ex.HResult),
+                        "MemQuota", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                IsActionInProgress = false;
+                if (!IsDisposed) UpdateButtons();
+            }
         }
 
         public void ShowNear(Point point)
@@ -102,17 +172,22 @@ namespace MemQuota
                     DrawText(g, name, headerFont, foreground, new Rectangle(63, y + 1, 200, 21));
                     string details = string.Format("{0:N0} MB  ·  {1:N1} %", app.Bytes / 1048576.0,
                         app.Bytes * 100.0 / snapshot.TotalBytes);
-                    DrawText(g, details, bodyFont, accent, new Rectangle(63, y + 21, 260, 20));
-                    y += 50;
+                    DrawText(g, details, bodyFont, accent, new Rectangle(63, y + 21, 235, 20));
+                    if (app.EstimatedReleasableBytes.HasValue)
+                    {
+                        string estimate = string.Format("Est. freed on exit: {0:N0} MB", app.EstimatedReleasableBytes.Value / 1048576.0);
+                        DrawText(g, estimate, smallFont, muted, new Rectangle(63, y + 41, 235, 18));
+                    }
+                    y += 63;
                 }
 
-                g.DrawLine(divider, 18, 331, Width - 18, 331);
+                g.DrawLine(divider, 18, 396, Width - 18, 396);
                 string total = string.Format("Total: {0:N0} / {1:N0} MB  ({2} %)",
                     snapshot.UsedBytes / 1048576.0, snapshot.TotalBytes / 1048576.0, snapshot.LoadPercent);
-                DrawText(g, total, headerFont, foreground, new Rectangle(20, 338, 380, 22));
+                DrawText(g, total, headerFont, foreground, new Rectangle(20, 403, 380, 22));
                 if (snapshot.InaccessibleProcesses > 0)
                     DrawText(g, string.Format("{0} processes could not be read", snapshot.InaccessibleProcesses), smallFont, muted,
-                        new Rectangle(20, 359, 380, 15));
+                        new Rectangle(20, 424, 380, 15));
             }
         }
 
@@ -146,6 +221,7 @@ namespace MemQuota
             {
                 foreach (Icon icon in icons.Values) icon.Dispose();
                 icons.Clear();
+                toolTip.Dispose();
                 titleFont.Dispose();
                 headerFont.Dispose();
                 bodyFont.Dispose();

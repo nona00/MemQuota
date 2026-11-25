@@ -185,7 +185,7 @@ namespace MemQuota
                     suppressHover = false;
                 return;
             }
-            if (!popup.Visible || popupPinned) return;
+            if (!popup.Visible || popupPinned || popup.IsActionInProgress) return;
             if (popup.Bounds.Contains(cursor) || cursor == lastTrayPoint)
             {
                 lastTrayMove = DateTime.UtcNow;
