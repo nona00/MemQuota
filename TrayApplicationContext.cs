@@ -35,6 +35,7 @@ namespace MemQuota
         {
             this.threshold = threshold;
             popup = new MemoryPopup();
+            popup.HideRequested += delegate { HidePopup(); };
             menu = new ContextMenuStrip();
             menu.Items.Add("Exit", null, delegate { ExitThread(); });
             trayIcon = new NotifyIcon { Text = "MemQuota: Checking memory", ContextMenuStrip = menu };
@@ -46,7 +47,7 @@ namespace MemQuota
             sampleTimer = new Timer { Interval = 100 };
             sampleTimer.Tick += async delegate
             {
-                sampleTimer.Interval = 2000;
+                sampleTimer.Interval = 5000;
                 await RefreshSnapshot();
             };
             animationTimer = new Timer { Interval = 80 };
@@ -74,7 +75,7 @@ namespace MemQuota
                     UpdateIcon();
                 }
                 popup.SetSnapshot(result);
-                trayIcon.Text = string.Format("MemQuota: {0}% memory used", result.LoadPercent);
+                trayIcon.Text = FormatTrayTooltip(result);
             }
             catch (Exception ex)
             {
@@ -91,6 +92,30 @@ namespace MemQuota
             {
                 sampling = false;
             }
+        }
+
+        private static string FormatTrayTooltip(MemorySnapshot value)
+        {
+            string memory = string.Format("Used: {0:N1} GB | Free: {1:N1} GB",
+                value.UsedBytes / 1073741824.0, (value.TotalBytes - value.UsedBytes) / 1073741824.0);
+            ApplicationMemory top = null;
+            foreach (ApplicationMemory application in value.Applications)
+            {
+                if (!string.Equals(application.Name, "Memory Compression", StringComparison.OrdinalIgnoreCase))
+                {
+                    top = application;
+                    break;
+                }
+            }
+            if (top == null)
+                return "Top: unavailable\n" + memory;
+
+            string suffix = string.Format(" - {0:N0} MB", top.Bytes / 1048576.0);
+            int nameLimit = Math.Max(0, 63 - "Top: ".Length - suffix.Length - 1 - memory.Length);
+            string name = top.Name;
+            if (name.Length > nameLimit)
+                name = nameLimit > 3 ? name.Substring(0, nameLimit - 3) + "..." : name.Substring(0, nameLimit);
+            return "Top: " + name + suffix + "\n" + memory;
         }
 
         private void Animate()
@@ -159,11 +184,17 @@ namespace MemQuota
             }
             else
             {
-                popup.Hide();
-                suppressHover = true;
-                lastTrayPoint = Cursor.Position;
-                lastTrayMove = DateTime.UtcNow;
+                HidePopup();
             }
+        }
+
+        private void HidePopup()
+        {
+            popupPinned = false;
+            popup.Hide();
+            suppressHover = true;
+            lastTrayPoint = Cursor.Position;
+            lastTrayMove = DateTime.UtcNow;
         }
 
         private void ShowPopup()

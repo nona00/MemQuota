@@ -89,6 +89,29 @@ namespace MemQuota
         private static extern bool QueryFullProcessImageName(SafeProcessHandle process, int flags,
             StringBuilder executableName, ref int size);
 
+        private delegate bool WindowCallback(IntPtr window, IntPtr parameter);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool EnumWindows(WindowCallback callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr window);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr window);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr window);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindowAsync(IntPtr window, int command);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr window);
+
         private static string GetExecutablePath(int processId)
         {
             const uint queryLimitedInformation = 0x1000;
@@ -110,6 +133,37 @@ namespace MemQuota
                     return null;
                 return creation;
             }
+        }
+
+        public static string ActivateApplication(ApplicationMemory application)
+        {
+            var targets = application.Processes.Where(target => target.CreationTime.HasValue)
+                .ToDictionary(target => target.Id, target => target.CreationTime.Value);
+            IntPtr selected = IntPtr.Zero;
+            bool enumerated = EnumWindows(delegate(IntPtr window, IntPtr parameter)
+            {
+                if (!IsWindowVisible(window) || GetWindowTextLength(window) == 0) return true;
+                uint processId;
+                GetWindowThreadProcessId(window, out processId);
+                long expected;
+                if (processId <= int.MaxValue && targets.TryGetValue((int)processId, out expected) &&
+                    GetCreationTime((int)processId) == expected)
+                {
+                    selected = window;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            if (selected == IntPtr.Zero)
+            {
+                if (!enumerated) return "Windows could not enumerate application windows.";
+                return "No accessible application window was found. The process may have exited or may not have a window.";
+            }
+            if (IsIconic(selected) && !ShowWindowAsync(selected, 9))
+                return "The application window could not be restored.";
+            if (!SetForegroundWindow(selected))
+                return "Windows did not allow the application window to be activated.";
+            return null;
         }
 
         public static string TrimWorkingSets(ApplicationMemory application)
@@ -176,12 +230,6 @@ namespace MemQuota
 
         public static MemorySnapshot Capture()
         {
-            var status = new MemoryStatus();
-            if (!GlobalMemoryStatusEx(status))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-            if (status.TotalPhysical == 0)
-                throw new InvalidOperationException("Total physical memory could not be determined.");
-
             var applications = new Dictionary<string, ApplicationMemory>(StringComparer.OrdinalIgnoreCase);
             int inaccessible = 0;
             Process[] processes = Process.GetProcesses();
@@ -211,8 +259,8 @@ namespace MemQuota
                 }
             }
 
-            List<ApplicationMemory> topApplications = applications.Values.OrderByDescending(item => item.Bytes).Take(5).ToList();
-            foreach (ApplicationMemory application in topApplications)
+            List<ApplicationMemory> sortedApplications = applications.Values.OrderByDescending(item => item.Bytes).ToList();
+            foreach (ApplicationMemory application in sortedApplications)
             {
                 ulong estimatedBytes = 0;
                 bool estimateAvailable = true;
@@ -229,13 +277,19 @@ namespace MemQuota
                 application.EstimatedReleasableBytes = estimateAvailable ? (ulong?)estimatedBytes : null;
             }
 
+            var status = new MemoryStatus();
+            if (!GlobalMemoryStatusEx(status))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (status.TotalPhysical == 0 || status.AvailablePhysical > status.TotalPhysical)
+                throw new InvalidOperationException("Physical memory information is invalid.");
+
             return new MemorySnapshot
             {
                 TotalBytes = status.TotalPhysical,
                 UsedBytes = status.TotalPhysical - status.AvailablePhysical,
                 LoadPercent = (int)status.MemoryLoad,
                 InaccessibleProcesses = inaccessible,
-                Applications = topApplications
+                Applications = sortedApplications
             };
         }
     }
